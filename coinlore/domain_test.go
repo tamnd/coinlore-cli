@@ -7,8 +7,7 @@ import (
 )
 
 // These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in coinlore_test.go.
+// and the host wiring, which need no network.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -24,10 +23,16 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in, typ, id string
+	}{
+		{"90", "coin", "90"},
+		{"12345", "coin", "12345"},
+		{"BTC", "symbol", "BTC"},
+		{"ETH", "symbol", "ETH"},
+		{"bitcoin", "symbol", "bitcoin"},
+		{"BTC2", "symbol", "BTC2"},
+		{"bitcoin cash", "query", "bitcoin cash"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
@@ -38,39 +43,95 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+func TestClassifyEmpty(t *testing.T) {
+	_, _, err := Domain{}.Classify("")
+	if err == nil {
+		t.Error("Classify(\"\") expected error, got nil")
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
+func TestLocate(t *testing.T) {
+	got, err := Domain{}.Locate("coin", "90")
+	want := "https://coinlore.com/crypto/90"
+	if err != nil || got != want {
+		t.Errorf("Locate(coin, 90) = (%q, %v), want (%q, nil)", got, err, want)
+	}
+}
+
+func TestLocateSymbol(t *testing.T) {
+	got, err := Domain{}.Locate("symbol", "BTC")
+	want := "https://coinlore.com/crypto/"
+	if err != nil || got != want {
+		t.Errorf("Locate(symbol, BTC) = (%q, %v), want (%q, nil)", got, err, want)
+	}
+}
+
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("unknown", "foo")
+	if err == nil {
+		t.Error("Locate(unknown, foo) expected error, got nil")
+	}
+}
+
 func TestHostWiring(t *testing.T) {
 	h, err := kit.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+	coin := &Coin{ID: "90", Symbol: "BTC", Name: "Bitcoin", Rank: 1, PriceUSD: "64140.22"}
+	u, err := h.Mint(coin)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "coinlore://page/wiki/Go"; u.String() != want {
+	if want := "coinlore://coin/90"; u.String() != want {
 		t.Errorf("Mint = %q, want %q", u.String(), want)
 	}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
+	got, err := h.ResolveOn("coinlore", "90")
+	if err != nil || got.String() != "coinlore://coin/90" {
+		t.Errorf("ResolveOn = (%q, %v), want coinlore://coin/90", got.String(), err)
 	}
+}
 
-	got, err := h.ResolveOn("coinlore", "about")
-	if err != nil || got.String() != "coinlore://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want coinlore://page/about", got.String(), err)
+func TestIsNumeric(t *testing.T) {
+	cases := []struct {
+		s    string
+		want bool
+	}{
+		{"90", true},
+		{"0", true},
+		{"12345", true},
+		{"BTC", false},
+		{"", false},
+		{"12a", false},
+	}
+	for _, tc := range cases {
+		got := isNumeric(tc.s)
+		if got != tc.want {
+			t.Errorf("isNumeric(%q) = %v, want %v", tc.s, got, tc.want)
+		}
+	}
+}
+
+func TestIsTickerSymbol(t *testing.T) {
+	cases := []struct {
+		s    string
+		want bool
+	}{
+		{"BTC", true},
+		{"ETH", true},
+		{"BTC2", true},
+		{"bitcoin", true},
+		{"90", false},
+		{"", false},
+		{"BTC-USD", false},
+		{"BTC USD", false},
+	}
+	for _, tc := range cases {
+		got := isTickerSymbol(tc.s)
+		if got != tc.want {
+			t.Errorf("isTickerSymbol(%q) = %v, want %v", tc.s, got, tc.want)
+		}
 	}
 }

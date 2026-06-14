@@ -1,35 +1,30 @@
 // Package coinlore is the library behind the coinlore command line:
-// the HTTP client, request shaping, and the typed data models for coinlore.
+// the HTTP client, request shaping, and the typed data models for CoinLore.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package coinlore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to coinlore. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "coinlore/dev (+https://github.com/tamnd/coinlore-cli)"
+// DefaultUserAgent identifies the client to CoinLore.
+const DefaultUserAgent = "coinlore-cli/dev (+https://github.com/tamnd/coinlore-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at coinlore.com; change it once you
-// know the real endpoints you want to read.
-const Host = "coinlore.com"
+// Host is the API host this client talks to.
+const Host = "api.coinlore.net"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to coinlore over HTTP.
+// Client talks to CoinLore over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,13 +35,13 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
+// NewClient returns a Client with sensible defaults: a 30s timeout, a 300ms
 // minimum gap between requests, and five retries on transient errors.
 func NewClient() *Client {
 	return &Client{
 		HTTP:      &http.Client{Timeout: 30 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
+		Rate:      300 * time.Millisecond,
 		Retries:   5,
 	}
 }
@@ -123,78 +118,114 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on coinlore.com. It is a stand-in for the typed records you
-// will model from the real coinlore endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `coinlore cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- data models ---
+
+// Coin holds the per-coin data returned by the tickers and ticker endpoints.
+type Coin struct {
+	ID               string  `kit:"id" json:"id"`
+	Symbol           string  `json:"symbol"`
+	Name             string  `json:"name"`
+	Rank             int     `json:"rank"`
+	PriceUSD         string  `json:"price_usd"`
+	PercentChange1h  string  `json:"percent_change_1h"`
+	PercentChange24h string  `json:"percent_change_24h"`
+	PercentChange7d  string  `json:"percent_change_7d"`
+	MarketCapUSD     string  `json:"market_cap_usd"`
+	Volume24         float64 `json:"volume24"`
+	CirculatingSupply string `json:"csupply"`
+	TotalSupply      string  `json:"tsupply"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
+// Market holds a single exchange market for a coin.
+type Market struct {
+	Name      string  `kit:"id" json:"name"`
+	Base      string  `json:"base"`
+	Quote     string  `json:"quote"`
+	Price     float64 `json:"price"`
+	PriceUSD  float64 `json:"price_usd"`
+	Volume    float64 `json:"volume"`
+	VolumeUSD float64 `json:"volume_usd"`
+}
+
+// GlobalStats holds the global crypto market overview.
+type GlobalStats struct {
+	CoinsCount    int     `kit:"id" json:"coins_count"`
+	ActiveMarkets int     `json:"active_markets"`
+	TotalMcap     float64 `json:"total_mcap"`
+	TotalVolume   float64 `json:"total_volume"`
+	BTCDominance  string  `json:"btc_d"`
+	ETHDominance  string  `json:"eth_d"`
+	McapChange    string  `json:"mcap_change"`
+	VolumeChange  string  `json:"volume_change"`
+}
+
+// --- client methods ---
+
+// ListCoins fetches a paginated list of coins by market rank.
+// limit controls how many coins to return (max 100); start is the offset.
+func (c *Client) ListCoins(ctx context.Context, limit, start int) ([]Coin, error) {
+	url := fmt.Sprintf("%s/api/tickers/?limit=%d&start=%d", BaseURL, limit, start)
 	body, err := c.Get(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+	var resp struct {
+		Data []Coin `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode tickers: %w", err)
+	}
+	return resp.Data, nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+// GetCoin fetches a single coin by its numeric ID (e.g. "90" for Bitcoin).
+func (c *Client) GetCoin(ctx context.Context, id string) (*Coin, error) {
+	url := fmt.Sprintf("%s/api/ticker/?id=%s", BaseURL, id)
+	body, err := c.Get(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	var coins []Coin
+	if err := json.Unmarshal(body, &coins); err != nil {
+		return nil, fmt.Errorf("decode ticker: %w", err)
 	}
-	return out, nil
+	if len(coins) == 0 {
+		return nil, fmt.Errorf("coin %s not found", id)
+	}
+	return &coins[0], nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// GetMarkets fetches the exchange markets for a coin by its numeric ID.
+// limit truncates the result client-side; the API returns up to 50.
+func (c *Client) GetMarkets(ctx context.Context, id string, limit int) ([]Market, error) {
+	url := fmt.Sprintf("%s/api/coin/markets/?id=%s", BaseURL, id)
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
 	}
-	return out
+	var markets []Market
+	if err := json.Unmarshal(body, &markets); err != nil {
+		return nil, fmt.Errorf("decode markets: %w", err)
+	}
+	if limit > 0 && len(markets) > limit {
+		markets = markets[:limit]
+	}
+	return markets, nil
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// GetGlobal fetches the global crypto market overview.
+func (c *Client) GetGlobal(ctx context.Context) (*GlobalStats, error) {
+	url := BaseURL + "/api/global/"
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
 	}
-	return s
+	var stats []GlobalStats
+	if err := json.Unmarshal(body, &stats); err != nil {
+		return nil, fmt.Errorf("decode global: %w", err)
+	}
+	if len(stats) == 0 {
+		return nil, fmt.Errorf("empty global response")
+	}
+	return &stats[0], nil
 }
